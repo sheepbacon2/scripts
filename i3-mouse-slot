@@ -1,0 +1,48 @@
+#!/usr/bin/python3
+"""Validated, atomic access to the existing ~/mousepos/.mousepos1–9 slots."""
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+
+ROOT=Path.home()/'mousepos'
+
+def notify(title, text):
+    subprocess.run(['notify-send','-t','1800',title,text],check=False)
+
+def main():
+    if sys.argv[1:]==['help']:
+        notify('Keyboard mouse', 'Hold WASD: glide | Q/E/Z/C or W+D: diagonals\nShift: fast | Ctrl: precision\nHold Enter: left drag; release to drop | Shift+Enter: right | Ctrl+Enter: middle\nAlt+Enter: double-click | Arrows: scroll | PgUp/PgDn: fast scroll\n1–9: click/save slot | Shift+1–9: save | Ctrl+1–9: jump only\nSpace: switch click/save mode | Escape: exit')
+        return
+    if len(sys.argv)!=3 or sys.argv[1] not in ('save','jump','click') or sys.argv[2] not in tuple('123456789'):
+        raise ValueError('Usage: i3-mouse-slot {save|jump|click} SLOT (1–9), or help')
+    action,slot=sys.argv[1:]; path=ROOT/f'.mousepos{slot}'
+    if action=='save':
+        output=subprocess.check_output(['xdotool','getmouselocation','--shell'],text=True)
+        coords=dict(line.split('=',1) for line in output.splitlines() if '=' in line)
+        x,y=int(coords['X']),int(coords['Y'])
+        ROOT.mkdir(parents=True,exist_ok=True)
+        temporary=None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w',dir=ROOT,prefix='.saving-',delete=False) as f:
+                temporary=Path(f.name); f.write(f'{x} {y}\n')
+            os.replace(temporary,path)
+        finally:
+            if temporary and temporary.exists(): temporary.unlink()
+        notify('Mouse position saved',f'Slot {slot}: X={x} Y={y}')
+    else:
+        if not path.is_file(): raise ValueError(f'Slot {slot} is empty. Use Shift+{slot} to save it.')
+        content=path.read_text()
+        if not re.fullmatch(r'\s*-?\d+\s+-?\d+\s*',content): raise ValueError(f'Slot {slot} is invalid. Save it again.')
+        x,y=map(int,content.split())
+        args=['xdotool','mousemove','--',str(x),str(y)]
+        if action=='click': args+=['click','--clearmodifiers','1']
+        subprocess.run(args,check=True)
+
+if __name__=='__main__':
+    try: main()
+    except (ValueError,OSError,KeyError,subprocess.SubprocessError) as exc:
+        print(str(exc),file=sys.stderr)
+        notify('Keyboard mouse',str(exc)); sys.exit(1)

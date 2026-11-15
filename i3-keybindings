@@ -1,0 +1,20 @@
+#!/usr/bin/python3
+"""Show configured shortcuts in a searchable, read-only rofi menu."""
+from pathlib import Path
+import subprocess
+root=Path.home()/'.config/i3'
+rows=[]
+for filename in ['bindings.conf','movements.conf','workspaces.conf','mouse.conf','session.conf']:
+    mode='default'
+    for line in (root/filename).read_text().splitlines():
+        s=line.strip()
+        if s.startswith('mode '): mode=s.split('"')[1]
+        if s=='}': mode='default'
+        if s.startswith('bindsym '):
+            binding=s[len('bindsym '):]
+            while binding.startswith('--'):
+                _, binding=binding.split(None,1)
+            key,action=binding.split(None,1)
+            key=key.replace('$mod','Super').replace('Mod1','Alt')
+            rows.append(f'{key:28} [{mode}] {action}')
+subprocess.run(['rofi','-dmenu','-i','-p','i3 shortcuts','-width','90'],input='\n'.join(rows),text=True)

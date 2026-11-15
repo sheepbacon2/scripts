@@ -1,0 +1,185 @@
+#!/home/wes/.local/share/i3-session/venv/bin/python
+"""Continuous keyboard pointer motion, active only in i3 mouse modes.
+
+No FIFO or per-frame subprocesses. Read real key state to avoid repeat delays
+and stuck movement on missed key-release events. A per-display lock permits
+safe repeated startup. IPC failure always stops motion until reconnected.
+"""
+import fcntl
+import hashlib
+import json
+import math
+import os
+import queue
+import threading
+import i3ipc
+from pathlib import Path
+import signal
+import socket
+import struct
+import subprocess
+import time
+from Xlib import X, XK, display
+from Xlib.ext import xtest
+
+MODES={'mousepos','mouseposClick'}
+DIRECTIONS={'w':(0,-1),'a':(-1,0),'s':(0,1),'d':(1,0),
+            'q':(-1,-1),'e':(1,-1),'z':(-1,1),'c':(1,1)}
+DEFAULTS={'fps':120,'normal_speed':550,'fast_speed':1600,
+          'precision_speed':70,'ramp_seconds':0.18}
+
+def settings():
+    result=DEFAULTS.copy()
+    path=Path.home()/'.config/i3/mouse-motion.json'
+    if path.exists(): result.update(json.loads(path.read_text()))
+    for key,value in result.items():
+        if key not in DEFAULTS or not isinstance(value,(int,float)) or not math.isfinite(value) or value<=0:
+            raise ValueError(f'Invalid mouse motion setting: {key}')
+    if not 30<=result['fps']<=240: raise ValueError('fps must be 30–240')
+    if max(result[k] for k in ('normal_speed','fast_speed','precision_speed'))>5000:
+        raise ValueError('Speed must be at most 5000 pixels/second')
+    return result
+
+class ModeConnection:
+    def __init__(self): self.sock=None
+    def close(self):
+        if self.sock: self.sock.close()
+        self.sock=None
+    def read(self,n):
+        data=b''
+        while len(data)<n:
+            chunk=self.sock.recv(n-len(data))
+            if not chunk: raise ConnectionError('i3 disconnected')
+            data+=chunk
+        return data
+    def mode(self):
+        if self.sock is None:
+            path=os.environ.get('I3SOCK') or subprocess.check_output(['i3','--get-socketpath'],text=True,timeout=2).strip()
+            self.sock=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+            self.sock.settimeout(.25); self.sock.connect(path)
+        # GET_BINDING_STATE (12), via a persistent i3 IPC socket.
+        self.sock.sendall(struct.pack('=6sII',b'i3-ipc',0,12))
+        magic,length,kind=struct.unpack('=6sII',self.read(14))
+        if magic!=b'i3-ipc' or kind!=12 or length>4096: raise ValueError('Invalid i3 IPC reply')
+        return json.loads(self.read(length))['name']
+
+def main():
+    state=Path(os.environ.get('XDG_RUNTIME_DIR',str(Path.home()/'.cache')))/'i3-mouse-smooth'
+    state.mkdir(mode=0o700,parents=True,exist_ok=True)
+    ident=hashlib.sha256(os.environ.get('DISPLAY','').encode()).hexdigest()[:16]
+    with (state/f'{ident}.lock').open('w') as lock:
+        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: return
+        cfg=settings(); reload_config=False; running=True
+        def stop(*_):
+            nonlocal running
+            running=False
+        def reload(*_):
+            nonlocal reload_config
+            reload_config=True
+        signal.signal(signal.SIGTERM,stop); signal.signal(signal.SIGINT,stop)
+        signal.signal(signal.SIGHUP,reload)
+        d=display.Display(); ipc=ModeConnection()
+        names=list(DIRECTIONS)+['Shift_L','Shift_R','Control_L','Control_R','Alt_L','Alt_R','Super_L','Super_R','Escape','Return']
+        codes={name:d.keysym_to_keycode(XK.string_to_keysym(name)) for name in names}
+        last=time.monotonic(); held_since=None; carry_x=carry_y=0.0
+        button_held=False; enter_was_down=True; pending_click=None
+        actions=queue.Queue()
+        def binding_event(_connection,event):
+            prefix='nop pointer-button-'
+            if event.binding.command.startswith(prefix):
+                actions.put(event.binding.command[len(prefix):])
+        def listen_buttons():
+            while running:
+                try:
+                    connection=i3ipc.Connection()
+                    connection.on('binding',binding_event)
+                    connection.main()
+                except Exception:
+                    pass
+                time.sleep(.25)
+        threading.Thread(target=listen_buttons,daemon=True).start()
+        def release_button():
+            nonlocal button_held
+            if button_held:
+                xtest.fake_input(d,X.ButtonRelease,detail=1)
+                d.flush()
+                button_held=False
+        def cancel_button():
+            nonlocal enter_was_down,pending_click
+            release_button()
+            enter_was_down=True  # Require a fresh press after mode exit/cancellation.
+            pending_click=None
+            while not actions.empty():
+                try: actions.get_nowait()
+                except queue.Empty: break
+        try:
+            while running:
+                started=time.monotonic()
+                if reload_config:
+                    cfg=settings(); reload_config=False
+                dt=min(started-last,.025); last=started
+                try: active=ipc.mode() in MODES
+                except (OSError,ValueError,KeyError,subprocess.SubprocessError):
+                    ipc.close(); active=False
+                if not active:
+                    cancel_button()
+                    held_since=None; carry_x=carry_y=0.0
+                    time.sleep(.05); continue
+                mask=d.query_keymap()
+                def down(name):
+                    code=codes[name]
+                    return bool(code and mask[code//8] & (1<<(code%8)))
+                enter=down('Return')
+                if down('Escape') or down('Super_L') or down('Super_R'):
+                    cancel_button()
+                else:
+                    # i3 binding events capture modifiers at the actual keypress,
+                    # including taps too brief for a polling frame to observe.
+                    while not actions.empty():
+                        try: action=actions.get_nowait()
+                        except queue.Empty: break
+                        if not enter_was_down and not button_held and pending_click is None:
+                            if action=='left':
+                                xtest.fake_input(d,X.ButtonPress,detail=1)
+                                d.flush(); button_held=True
+                            elif action in ('right','middle','double'):
+                                pending_click={'right':['3'],'middle':['2'],
+                                               'double':['--repeat','2','--delay','100','1']}[action]
+                    if not enter:
+                        release_button()
+                        if pending_click:
+                            subprocess.Popen(['xdotool','click','--clearmodifiers',*pending_click],
+                                             stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+                            pending_click=None
+                    # A press may arrive just after key polling. Only latch once
+                    # its binding event was received, or after cancellation.
+                    if not enter: enter_was_down=False
+                    elif button_held or pending_click: enter_was_down=True
+                # Don't move while exiting or using unrelated modifier shortcuts.
+                blocked=any(down(k) for k in ('Escape','Alt_L','Alt_R','Super_L','Super_R'))
+                x=sum(v[0] for k,v in DIRECTIONS.items() if down(k)) if not blocked else 0
+                y=sum(v[1] for k,v in DIRECTIONS.items() if down(k)) if not blocked else 0
+                length=math.hypot(x,y)
+                if not length:
+                    held_since=None; carry_x=carry_y=0.0
+                else:
+                    if held_since is None: held_since=started
+                    precision=down('Control_L') or down('Control_R')
+                    fast=down('Shift_L') or down('Shift_R')
+                    speed=cfg['precision_speed' if precision else 'fast_speed' if fast else 'normal_speed']
+                    # Gentle start; release stops immediately (no drifting).
+                    ramp=1 if precision else .25+.75*min(1,(started-held_since)/cfg['ramp_seconds'])
+                    carry_x+=x/length*speed*ramp*dt
+                    carry_y+=y/length*speed*ramp*dt
+                    dx,dy=math.trunc(carry_x),math.trunc(carry_y)
+                    carry_x-=dx; carry_y-=dy
+                    if dx or dy:
+                        xtest.fake_input(d,X.MotionNotify,detail=1,x=dx,y=dy)
+                        d.flush()
+                time.sleep(max(0,1/cfg['fps']-(time.monotonic()-started)))
+        finally:
+            release_button()
+            ipc.close(); d.close()
+
+if __name__=='__main__': main()

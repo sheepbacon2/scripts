@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# Preview by default; --apply asks separately before each cleanup stage.
+set -uo pipefail
+apply=0
+case ${1:-} in
+    '') ;;
+    --apply) apply=1 ;;
+    -h|--help) printf 'Usage: cleanup-system [--apply]\nDefault: inspect only. --apply: confirm each cleanup stage.\n'; exit 0 ;;
+    *) printf 'Unknown option: %s\n' "$1" >&2; exit 2 ;;
+esac
+(( EUID != 0 )) || { printf 'Run this as your normal user; sudo is requested where needed.\n' >&2; exit 1; }
+failures=0
+ask() {
+    local reply
+    (( apply )) || return 1
+    read -r -p "$1 [y/N] " reply || return 1
+    [[ $reply == y || $reply == Y || $reply == yes ]]
+}
+run() {
+    "$@" || { printf 'Stage failed: %s\n' "$1" >&2; failures=1; }
+}
+# Return status 1 from -Qdtq means no orphan packages were found.
+orphan_file=$(mktemp) || exit 1
+trap 'rm -f -- "$orphan_file"' EXIT
+pacman -Qdtq > "$orphan_file"
+query_status=$?
+if (( query_status > 1 )); then printf 'Unable to query package database.\n' >&2; exit 1; fi
+mapfile -t orphans < "$orphan_file"
+printf '\nDisk space before cleanup:\n'
+df -h /
+printf '\nOrphan dependencies (%s):\n' "${#orphans[@]}"
+if ((${#orphans[@]})); then
+    pacman -Qi -- "${orphans[@]}" | awk '/^Name / || /^Description / || /^Installed Size / {print}'
+    printf '\nThese are dependency-installed packages without package dependents.\n'
+    printf 'If you use one directly, keep it with: sudo pacman -D --asexplicit PACKAGE\n'
+    if ask 'Review removal of these orphan packages with pacman?'; then
+        # Nonrecursive removal avoids pulling additional optional dependencies;
+        # normal pacman checks and confirmation remain enabled. Keep .pacsave.
+        run sudo pacman -R -- "${orphans[@]}"
+    fi
+else
+    printf 'None found.\n'
+fi
+printf '\nPacman cache (keep the newest TWO versions of each package):\n'
+if command -v paccache >/dev/null; then
+    run paccache -d -k 2
+    if ask 'Remove the older cached pacman packages?'; then run sudo paccache -r -k 2; fi
+else
+    printf 'paccache unavailable; install pacman-contrib to enable this stage.\n'
+fi
+printf '\nAUR build/download cache:\n'
+aur_cache="$HOME/.cache/yay"
+if [[ -d $aur_cache && ! -L $aur_cache ]]; then
+    du -sh -- "$aur_cache"
+    printf 'Clearing this deletes AUR sources, build trees, and cached package archives.\n'
+    printf 'Future AUR builds will download/build again; installed packages are unaffected.\n'
+    if ask 'Clear your entire yay cache?'; then
+        if pgrep -u "$UID" -x 'yay|makepkg|ninja|meson' >/dev/null; then
+            printf 'A package build/update is running. Skipping AUR cache cleanup.\n' >&2
+            failures=1
+        else
+            # Fixed path, no sudo, no following a symlink at the cache root.
+            run python3 - <<'PY'
+import os
+from pathlib import Path
+import shutil
+root=Path.home()/'.cache/yay'
+if root.is_symlink() or not root.is_dir():
+    raise SystemExit('Cache changed or is a symlink; refusing cleanup.')
+def make_removable(path):
+    # Some makepkg staging directories are user-owned but execute-only.
+    # Restore owner access only inside this explicitly selected build cache.
+    if path.is_symlink() or not path.is_dir():
+        return
+    st=path.stat()
+    if st.st_uid != os.getuid():
+        raise PermissionError(f'Cache directory belongs to another user: {path}')
+    path.chmod(st.st_mode | 0o700)
+    for item in path.iterdir():
+        make_removable(item)
+
+for child in root.iterdir():
+    if child.is_symlink() or not child.is_dir():
+        child.unlink()
+    else:
+        make_removable(child)
+        shutil.rmtree(child)
+print('Cleared yay cache.')
+PY
+        fi
+    fi
+else
+    printf 'No regular yay cache directory found.\n'
+fi
+printf '\nUnused Flatpak components (Flatpak presents its own removal list):\n'
+if command -v flatpak >/dev/null; then
+    if ask 'Check and remove unused USER Flatpak components?'; then run flatpak uninstall --user --unused; fi
+    if ask 'Check and remove unused SYSTEM Flatpak components?'; then run sudo flatpak uninstall --system --unused; fi
+fi
+printf '\nSystem journal usage:\n'
+run journalctl --disk-usage
+printf 'Optional journal cleanup keeps at most 14 days / 200 MB of archived logs.\n'
+if ask 'Trim archived system journal logs?'; then
+    run sudo journalctl --rotate --vacuum-time=14d --vacuum-size=200M
+fi
+printf '\nDisk space now:\n'
+df -h /
+if (( ! apply )); then
+    printf '\nPreview only. Run cleanup-system --apply to choose cleanup stages.\n'
+else
+    printf '\nCleanup finished. Personal files and Trash were not cleanup targets.\n'
+fi
+exit "$failures"
